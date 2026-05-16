@@ -7,39 +7,43 @@ if not repo then
   print("Usage:")
   print("  ghclone <user/repo> [branch] [token]")
   print()
-  print("  First run (saves token for later):")
+  print("  First run (saves token to /env):")
   print("    wget run https://raw.githubusercontent.com/Gazdea/ghclone/master/ghclone.lua Gazdea/Aerogugaga master ghp_xxxxx")
   print()
-  print("  Subsequent runs (if token saved):")
-  print("    ghclone Gazdea/Aerogugaga master")
+  print("  Subsequent runs:")
   print("    ghclone Gazdea/Aerogugaga")
   return
 end
 
 local repoName = repo:match("/(.+)$") or repo
 local dest = "projects/" .. repoName
-
 local headers = {["User-Agent"] = "ghclone/1.0"}
 
+-- Read token from /env if not provided as arg
 if not token or token == "" then
-  if fs.exists("/.ghtoken") then
-    local f = fs.open("/.ghtoken", "r")
+  if fs.exists("/env") then
+    local f = fs.open("/env", "r")
     if f then
       token = f.readAll():gsub("^%s*(.-)%s*$", "%1")
       f.close()
+      if token and token ~= "" then
+        print("Token: /env")
+      end
     end
   end
 end
 
+-- Save token if provided as arg
 if token and token ~= "" then
+  local f = fs.open("/env", "w")
+  if f then
+    f.write(token)
+    f.close()
+    print("Token saved to /env")
+  else
+    print("Warning: cannot write /env")
+  end
   headers["Authorization"] = "Bearer " .. token
-end
-
-if token and token ~= "" and not fs.exists("/.ghtoken") then
-  local f = fs.open("/.ghtoken", "w")
-  f.write(token)
-  f.close()
-  print("Token saved to /.ghtoken")
 end
 
 print("== ghclone: " .. repo .. " (" .. branch .. ") => /" .. dest)
@@ -114,8 +118,10 @@ if not fs.exists("ghclone") then
     local content = resp3.readAll()
     resp3.close()
     local f = fs.open("ghclone", "w")
-    f.write(content)
-    f.close()
-    print("Installed /ghclone")
+    if f then
+      f.write(content)
+      f.close()
+      print("Installed /ghclone")
+    end
   end
 end
