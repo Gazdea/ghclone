@@ -1,25 +1,44 @@
 local args = {...}
-local repo = args[1]
+local raw = args[1] or ""
 local branch = args[2] or "master"
 local token = args[3]
 
-if not repo then
+-- Parse Gazdea/Aerogugaga[/subdir]
+local first = raw:find("/")
+if not first then
   print("Usage:")
-  print("  ghclone <user/repo> [branch] [token]")
+  print("  ghclone <user/repo>[/subdir] [branch] [token]")
+  print()
+  print("  Full repo:")
+  print("    ghclone Gazdea/Aerogugaga")
+  print("    ghclone Gazdea/Aerogugaga master ghp_xxx")
+  print()
+  print("  Single subdirectory:")
+  print("    ghclone Gazdea/Aerogugaga/cc-aero-control")
   print()
   print("  First run (saves token to /env):")
-  print("    wget run https://raw.githubusercontent.com/Gazdea/ghclone/master/ghclone.lua Gazdea/Aerogugaga master ghp_xxxxx")
-  print()
-  print("  Subsequent runs:")
-  print("    ghclone Gazdea/Aerogugaga")
+  print("    wget run https://raw.githubusercontent.com/Gazdea/ghclone/master/ghclone.lua Gazdea/Aerogugaga master ghp_xxx")
   return
 end
 
-local repoName = repo:match("/(.+)$") or repo
+local user = raw:sub(1, first - 1)
+local rest = raw:sub(first + 1)
+local second = rest:find("/")
+local repoName, subdir
+
+if second then
+  repoName = rest:sub(1, second - 1)
+  subdir = rest:sub(second + 1)
+else
+  repoName = rest
+  subdir = nil
+end
+
+local fullRepo = user .. "/" .. repoName
 local dest = "projects/" .. repoName
 local headers = {["User-Agent"] = "ghclone/1.0"}
 
--- Read token from /env if not provided as arg
+-- Read token from /env if not provided
 if not token or token == "" then
   if fs.exists("/env") then
     local f = fs.open("/env", "r")
@@ -33,7 +52,7 @@ if not token or token == "" then
   end
 end
 
--- Save token if provided as arg
+-- Save token if provided
 if token and token ~= "" then
   local f = fs.open("/env", "w")
   if f then
@@ -46,9 +65,11 @@ if token and token ~= "" then
   headers["Authorization"] = "Bearer " .. token
 end
 
-print("== ghclone: " .. repo .. " (" .. branch .. ") => /" .. dest)
+local label = subdir and (fullRepo .. "/" .. subdir) or fullRepo
+print("== ghclone: " .. label .. " (" .. branch .. ") => /" .. dest)
 
-local apiUrl = "https://api.github.com/repos/" .. repo .. "/git/trees/" .. branch .. "?recursive=1"
+-- Fetch full tree via API
+local apiUrl = "https://api.github.com/repos/" .. fullRepo .. "/git/trees/" .. branch .. "?recursive=1"
 local resp, err = http.get(apiUrl, headers)
 if not resp then
   print("Error: " .. tostring(err))
@@ -64,19 +85,23 @@ if not ok or not tree.tree then
   if tree and tree.message then
     print("  " .. tree.message)
     if tree.message:find("rate limit") then
-      print("  Use a token to increase rate limit (5000 req/h)")
+      print("  Use a token (5000 req/h)")
     end
     if tree.message:find("Not Found") then
-      print("  Check: repo name, branch, and token access")
+      print("  Check: repo, branch, token")
     end
   end
   return
 end
 
+-- Filter by subdir
+local prefix = subdir and (subdir .. "/") or ""
 local files = {}
 for _, entry in ipairs(tree.tree) do
   if entry.type == "blob" then
-    files[#files + 1] = entry.path
+    if not subdir or entry.path:find(prefix, 1, true) == 1 then
+      files[#files + 1] = entry.path
+    end
   end
 end
 
@@ -92,7 +117,7 @@ for _, path in ipairs(files) do
     fs.makeDir(dir)
   end
 
-  local rawUrl = "https://raw.githubusercontent.com/" .. repo .. "/" .. branch .. "/" .. path
+  local rawUrl = "https://raw.githubusercontent.com/" .. fullRepo .. "/" .. branch .. "/" .. path
   local resp2 = http.get(rawUrl)
 
   if resp2 then
