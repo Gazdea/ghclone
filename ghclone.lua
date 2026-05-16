@@ -1,6 +1,6 @@
 local args = {...}
 local repo = args[1]
-local branch = args[2] or "main"
+local branch = args[2] or "master"
 local token = args[3]
 
 if not repo then
@@ -8,10 +8,10 @@ if not repo then
   print("  ghclone <user/repo> [branch] [token]")
   print()
   print("  First run (saves token for later):")
-  print("    wget run https://raw.githubusercontent.com/Gazdea/ghclone/main/ghclone.lua Gazdea/Aerogugaga main ghp_xxxxx")
+  print("    wget run https://raw.githubusercontent.com/Gazdea/ghclone/master/ghclone.lua Gazdea/Aerogugaga master ghp_xxxxx")
   print()
   print("  Subsequent runs (if token saved):")
-  print("    ghclone Gazdea/Aerogugaga main")
+  print("    ghclone Gazdea/Aerogugaga master")
   print("    ghclone Gazdea/Aerogugaga")
   return
 end
@@ -108,7 +108,7 @@ end
 print("Done: " .. ok .. " new/updated, " .. fail .. " failed")
 
 if not fs.exists("ghclone") then
-  local myUrl = "https://raw.githubusercontent.com/Gazdea/ghclone/main/ghclone.lua"
+  local myUrl = "https://raw.githubusercontent.com/Gazdea/ghclone/master/ghclone.lua"
   local resp3 = http.get(myUrl)
   if resp3 then
     local content = resp3.readAll()
