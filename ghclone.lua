@@ -45,7 +45,7 @@ local function api(repo, branch, token)
   end
   local url = "https://api.github.com/repos/" .. repo .. "/git/trees/" .. branch .. "?recursive=1"
   local resp = http.get(url, headers)
-  if not resp then return nil, "HTTP failed" end
+  if not resp then return nil, "HTTP failed: " .. url end
   local data = resp.readAll()
   resp.close()
   local ok, tree = pcall(textutils.unserialiseJSON, data)
@@ -257,13 +257,14 @@ end
 -- Direct mode: ghclone user/repo[/subdir] [branch] [token]
 local raw = args[1]
 local branch = args[2] or "master"
-local token = args[3] or getToken()
 
-if not token and args[3] then
+-- Save token if provided (before getToken, so it persists for next run)
+if args[3] and args[3] ~= "" then
   writeFile("/env", args[3])
   print("Token saved to /env")
-  token = args[3]
 end
+
+local token = args[3] or getToken()
 
 local first = raw:find("/")
 if not first then
