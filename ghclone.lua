@@ -282,11 +282,6 @@ function Renderer.fileBrowser(state)
   local start = (state.page - 1) * PER_PAGE + 1
   local finish = math.min(start + PER_PAGE - 1, total)
 
-  for i = 1, PER_PAGE do
-    local idx = start + i - 1
-    Renderer.write(2 + i, 1, "  ")
-  end
-
   for i = start, finish do
     local item = items[i]
     local y = 2 + (i - start + 1)
@@ -299,14 +294,13 @@ function Renderer.fileBrowser(state)
     Renderer.write(y, 1, line)
   end
 
-  -- Page nav
-  if state.page > 1 then Renderer.write(3, 1, "< Prev") end
-  if state.page < pages then Renderer.write(7, w - 6, "Next >") end
-
   Renderer.separator(8, w)
 
   Renderer.write(9, 1, "Page " .. state.page .. "/" .. pages .. "  Sel: " .. stateCountSelected(state))
-  Renderer.write(10, 1, "[SPC] Toggle [a]All [d]Load [q]uit [<][>]")
+  local navLine = ""
+  if state.page > 1 then navLine = navLine .. "[<] Prev  " end
+  if state.page < pages then navLine = navLine .. "[>] Next  " end
+  Renderer.write(10, 1, navLine .. "[SPC] Toggle  [a]All  [d]Load  [q]uit")
 end
 
 function Renderer.download(state)
@@ -354,29 +348,16 @@ end
 -- ========================================
 local Input = {}
 
-local KEY_UP = 200
-local KEY_DOWN = 208
-local KEY_LEFT = 203
-local KEY_RIGHT = 205
-local KEY_ENTER = 28
-local KEY_SPACE = 57
-local KEY_A = 65
-local KEY_D = 68
-local KEY_Q = 81
-local KEY_S = 83
-local KEY_A_low = 97
-local KEY_D_low = 100
-local KEY_Q_low = 113
-local KEY_S_low = 115
+-- Use CC:T keys API for correct scancodes
 
 function Input.handleRepoSelect(state, event, a1, a2, a3)
   if event == "key" then
     local key = a1
-    if key == KEY_DOWN then
+    if key == keys.down then
       if state.cursor < #state.repos then state.cursor = state.cursor + 1 else state.cursor = 1 end
-    elseif key == KEY_UP then
+    elseif key == keys.up then
       if state.cursor > 1 then state.cursor = state.cursor - 1 else state.cursor = #state.repos end
-    elseif key == KEY_ENTER or key == KEY_RIGHT then
+    elseif key == keys.enter or key == keys.right or key == keys.kpEnter then
       if #state.repos > 0 then
         state.repo = state.repos[state.cursor]
         state.screen = SCREENS.FILE_BROWSER
@@ -391,14 +372,14 @@ function Input.handleRepoSelect(state, event, a1, a2, a3)
           state.screen = SCREENS.REPO_SELECT
         end
       end
-    elseif key == KEY_A or key == KEY_A_low then
+    elseif key == keys.a then
       Input.promptAddRepo(state)
-    elseif key == KEY_Q or key == KEY_Q_low then
+    elseif key == keys.q then
       return false
     end
   elseif event == "mouse_click" then
-    local y = a2
-    local idx = y - 2
+    local mx, my = a2, a3
+    local idx = my - 2
     if idx >= 1 and idx <= #state.repos then
       state.cursor = idx
       state.repo = state.repos[state.cursor]
@@ -447,27 +428,25 @@ function Input.handleFileBrowser(state, event, a1, a2, a3)
 
   if event == "key" then
     local key = a1
-    if key == KEY_DOWN then
+    if key == keys.down then
       if state.cursor < total then
         state.cursor = state.cursor + 1
         if state.cursor > state.page * PER_PAGE then
           state.page = state.page + 1
         end
       end
-    elseif key == KEY_UP then
+    elseif key == keys.up then
       if state.cursor > 1 then
         state.cursor = state.cursor - 1
         if state.cursor < (state.page - 1) * PER_PAGE + 1 then
           state.page = state.page - 1
         end
       end
-    elseif key == KEY_LEFT then
+    elseif key == keys.left then
       if state.path == "" then
-        -- Go back to repo select only if at root
         state.screen = SCREENS.REPO_SELECT
         state.cursor = 1
       else
-        -- Go to parent directory
         local parts = split(state.path, "/")
         table.remove(parts)
         state.path = table.concat(parts, "/")
@@ -475,7 +454,7 @@ function Input.handleFileBrowser(state, event, a1, a2, a3)
         state.page = 1
         state.items = stateGetDirContents(state)
       end
-    elseif key == KEY_RIGHT or key == KEY_ENTER then
+    elseif key == keys.right or key == keys.enter or key == keys.kpEnter then
       local item = items[state.cursor]
       if item and item.isDir then
         state.path = item.path
@@ -483,12 +462,12 @@ function Input.handleFileBrowser(state, event, a1, a2, a3)
         state.page = 1
         state.items = stateGetDirContents(state)
       end
-    elseif key == KEY_SPACE or key == KEY_S or key == KEY_S_low then
+    elseif key == keys.space or key == keys.s then
       local item = items[state.cursor]
       if item then stateSelectItem(state, item) end
-    elseif key == KEY_A or key == KEY_A_low then
+    elseif key == keys.a then
       stateSelectAll(state)
-    elseif key == KEY_D or key == KEY_D_low then
+    elseif key == keys.d then
       if stateCountSelected(state) > 0 then
         state.downloadQueue = {}
         for p, _ in pairs(state.selected) do
@@ -500,7 +479,7 @@ function Input.handleFileBrowser(state, event, a1, a2, a3)
         state.screen = SCREENS.DOWNLOAD
         Input.runDownload(state)
       end
-    elseif key == KEY_Q or key == KEY_Q_low then
+    elseif key == keys.q then
       if state.path == "" then
         state.screen = SCREENS.REPO_SELECT
         state.cursor = 1
@@ -513,13 +492,47 @@ function Input.handleFileBrowser(state, event, a1, a2, a3)
         state.items = stateGetDirContents(state)
       end
     end
+  elseif event == "mouse_scroll" then
+    if a1 == 1 and state.page > 1 then
+      state.page = state.page - 1
+      state.cursor = (state.page - 1) * PER_PAGE + 1
+    elseif a1 == -1 and state.page < pages then
+      state.page = state.page + 1
+      state.cursor = (state.page - 1) * PER_PAGE + 1
+    end
   elseif event == "mouse_click" then
-    local y = a2
-    local idx = y - 2
-    if idx >= 1 and idx <= PER_PAGE then
-      local itemIdx = (state.page - 1) * PER_PAGE + idx
-      if itemIdx >= 1 and itemIdx <= #items then
-        state.cursor = itemIdx
+    local mx, my = a2, a3
+    local w, h = term.getSize()
+    -- Page nav clicks (line 10)
+    if my == 10 then
+      local onPrev = state.page > 1 and mx <= 12
+      local onNext = state.page < pages and mx > 12
+      if onPrev then
+        state.page = state.page - 1
+        state.cursor = (state.page - 1) * PER_PAGE + 1
+      elseif onNext then
+        state.page = state.page + 1
+        state.cursor = (state.page - 1) * PER_PAGE + 1
+      end
+    else
+      -- File list click
+      local idx = my - 2
+      if idx >= 1 and idx <= PER_PAGE then
+        local itemIdx = (state.page - 1) * PER_PAGE + idx
+        if itemIdx >= 1 and itemIdx <= #items then
+          state.cursor = itemIdx
+          local item = items[itemIdx]
+          if item then
+            if item.isDir then
+              state.path = item.path
+              state.cursor = 1
+              state.page = 1
+              state.items = stateGetDirContents(state)
+            else
+              stateSelectItem(state, item)
+            end
+          end
+        end
       end
     end
   end
