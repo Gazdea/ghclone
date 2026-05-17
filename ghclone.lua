@@ -605,6 +605,7 @@ function Input.runDownload(state)
 
     local content = GitHub.getFile(url)
     if content then
+      if fs.exists(fp) then fs.delete(fp) end
       local f = fs.open(fp, "w")
       if f then
         f.write(content)
@@ -712,6 +713,7 @@ local function directClone(repo, subdir, branch, token)
     local url = "https://raw.githubusercontent.com/" .. repo .. "/" .. branch .. "/" .. path
     local content = GitHub.getFile(url)
     if content then
+      if fs.exists(fp) then fs.delete(fp) end
       local f = fs.open(fp, "w")
       if f then f.write(content) f.close() end
       ok = ok + 1
