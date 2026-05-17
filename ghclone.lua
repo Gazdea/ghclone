@@ -1,4 +1,18 @@
--- Helpers
+-- ========================================
+-- ghclone v3 — GitHub file browser for CC:T
+-- ========================================
+
+-- ========================================
+-- CONFIG
+-- ========================================
+local PER_PAGE = 5
+local SELF_URL = "https://raw.githubusercontent.com/Gazdea/ghclone/master/ghclone.lua"
+local REPOS_PATH = "/repos"
+local ENV_PATH = "/env"
+
+-- ========================================
+-- UTILITIES
+-- ========================================
 local function readFile(p)
   if not fs.exists(p) then return nil end
   local f = fs.open(p, "r")
@@ -16,36 +30,56 @@ local function writeFile(p, c)
   return true
 end
 
+local function trim(s)
+  return s:gsub("^%s*(.-)%s*$", "%1")
+end
+
+local function split(s, sep)
+  local t = {}
+  for m in s:gmatch("[^" .. sep .. "]+") do
+    t[#t + 1] = m
+  end
+  return t
+end
+
 local function loadRepos()
-  local c = readFile("/repos")
+  local c = readFile(REPOS_PATH)
   if not c then return {} end
   local t = {}
   for line in c:gmatch("[^\r\n]+") do
-    line = line:gsub("^%s*(.-)%s*$", "%1")
+    line = trim(line)
     if line ~= "" then t[#t + 1] = line end
   end
   return t
 end
 
 local function saveRepos(t)
-  return writeFile("/repos", table.concat(t, "\n"))
+  return writeFile(REPOS_PATH, table.concat(t, "\n"))
 end
 
 local function getToken()
-  local c = readFile("/env")
+  local c = readFile(ENV_PATH)
   if not c then return nil end
-  return c:gsub("^%s*(.-)%s*$", "%1")
+  return trim(c)
 end
 
--- GitHub API
-local function api(repo, branch, token)
-  local headers = {["User-Agent"] = "ghclone/1.0"}
+-- ========================================
+-- GITHUB API
+-- ========================================
+local GitHub = {}
+
+function GitHub.authHeaders(token)
+  local h = {["User-Agent"] = "ghclone/3.0"}
   if token and token ~= "" then
-    headers["Authorization"] = "Bearer " .. token
+    h["Authorization"] = "Bearer " .. token
   end
+  return h
+end
+
+function GitHub.getTree(repo, branch, token)
   local url = "https://api.github.com/repos/" .. repo .. "/git/trees/" .. branch .. "?recursive=1"
-  local resp = http.get(url, headers)
-  if not resp then return nil, "HTTP failed: " .. url end
+  local resp = http.get(url, GitHub.authHeaders(token))
+  if not resp then return nil, "HTTP failed" end
   local data = resp.readAll()
   resp.close()
   local ok, tree = pcall(textutils.unserialiseJSON, data)
@@ -55,25 +89,547 @@ local function api(repo, branch, token)
   return tree, nil
 end
 
--- Get top-level directories from a repo
-local function getDirs(repo, branch, token)
-  local tree, err = api(repo, branch, token)
-  if not tree then return nil, err end
-  local seen, dirs = {}, {}
-  for _, e in ipairs(tree.tree) do
-    if e.type == "tree" and not e.path:find("/") and not seen[e.path] then
-      seen[e.path] = true
-      dirs[#dirs + 1] = e.path
-    end
-  end
-  table.sort(dirs)
-  return dirs, nil, tree
+function GitHub.getFile(url)
+  local resp = http.get(url)
+  if not resp then return nil end
+  local c = resp.readAll()
+  resp.close()
+  return c
 end
 
--- Clone files into current directory
-local function clone(repo, subdir, branch, token)
-  local tree, err = api(repo, branch, token)
-  if not tree then print("Error: " .. err) return false end
+-- ========================================
+-- STATE
+-- ========================================
+local SCREENS = {REPO_SELECT = 1, FILE_BROWSER = 2, DOWNLOAD = 3}
+
+local function newState()
+  return {
+    screen = SCREENS.REPO_SELECT,
+    repos = {},
+    repo = nil,
+    branch = "master",
+    token = nil,
+    -- File browser
+    tree = nil,
+    path = "",
+    items = {},
+    cursor = 1,
+    page = 1,
+    selected = {},
+    -- Download
+    downloadQueue = {},
+    downloadResults = {},
+    downloadRunning = false,
+  }
+end
+
+function stateGetDirContents(state)
+  local dirs, files = {}, {}
+  local prefix = state.path ~= "" and (state.path .. "/") or ""
+  local seenDirs = {}
+
+  if not state.tree then return dirs, files end
+
+  for _, entry in ipairs(state.tree.tree) do
+    if entry.type == "blob" and entry.path:find(prefix, 1, true) == 1 then
+      local rest = entry.path:sub(#prefix + 1)
+      local slash = rest:find("/")
+      if slash then
+        local d = rest:sub(1, slash - 1)
+        if not seenDirs[d] then
+          seenDirs[d] = true
+          dirs[#dirs + 1] = {name = d, path = (state.path ~= "" and state.path .. "/" or "") .. d, isDir = true}
+        end
+      else
+        files[#files + 1] = {name = rest, path = entry.path, isDir = false, size = entry.size}
+      end
+    end
+  end
+
+  table.sort(dirs, function(a, b) return a.name < b.name end)
+  table.sort(files, function(a, b) return a.name < b.name end)
+
+  local items = {}
+  for _, d in ipairs(dirs) do items[#items + 1] = d end
+  for _, f in ipairs(files) do items[#items + 1] = f end
+  return items
+end
+
+function stateGetFilesInDir(state, dirPath)
+  local paths = {}
+  local prefix = dirPath ~= "" and (dirPath .. "/") or ""
+  if not state.tree then return paths end
+  for _, entry in ipairs(state.tree.tree) do
+    if entry.type == "blob" and entry.path:find(prefix, 1, true) == 1 then
+      paths[#paths + 1] = entry.path
+    end
+  end
+  return paths
+end
+
+function stateSelectItem(state, item)
+  if item.isDir then
+    local paths = stateGetFilesInDir(state, item.path)
+    local allSelected = true
+    for _, p in ipairs(paths) do
+      if not state.selected[p] then allSelected = false; break end
+    end
+    if allSelected then
+      for _, p in ipairs(paths) do state.selected[p] = nil end
+    else
+      for _, p in ipairs(paths) do state.selected[p] = true end
+    end
+  else
+    if state.selected[item.path] then
+      state.selected[item.path] = nil
+    else
+      state.selected[item.path] = true
+    end
+  end
+end
+
+function stateSelectAll(state)
+  local items = stateGetDirContents(state)
+  if #items == 0 then return end
+  local allSelected = true
+  for _, item in ipairs(items) do
+    if item.isDir then
+      local paths = stateGetFilesInDir(state, item.path)
+      for _, p in ipairs(paths) do
+        if not state.selected[p] then allSelected = false; break end
+      end
+    else
+      if not state.selected[item.path] then allSelected = false; break end
+    end
+    if not allSelected then break end
+  end
+  for _, item in ipairs(items) do
+    if item.isDir then
+      local paths = stateGetFilesInDir(state, item.path)
+      for _, p in ipairs(paths) do
+        if allSelected then state.selected[p] = nil else state.selected[p] = true end
+      end
+    else
+      if allSelected then state.selected[item.path] = nil else state.selected[item.path] = true end
+    end
+  end
+end
+
+function stateCountSelected(state)
+  local n = 0
+  for _, _ in pairs(state.selected) do n = n + 1 end
+  return n
+end
+
+-- ========================================
+-- RENDERER
+-- ========================================
+local Renderer = {}
+
+function Renderer.clear()
+  term.clear()
+  term.setCursorPos(1, 1)
+end
+
+function Renderer.write(y, x, text)
+  term.setCursorPos(x or 1, y)
+  term.write(text)
+end
+
+function Renderer.separator(y, w, char)
+  Renderer.write(y, 1, string.rep(char or "-", w))
+end
+
+function Renderer.repoSelect(state)
+  local w, h = term.getSize()
+  Renderer.clear()
+  Renderer.write(1, 1, "ghclone - Select repository")
+  Renderer.separator(2, w, "=")
+
+  for i, r in ipairs(state.repos) do
+    local prefix = (i == state.cursor) and "> " or "  "
+    Renderer.write(2 + i, 1, prefix .. "[" .. i .. "] " .. r)
+  end
+
+  local y = 2 + #state.repos + 1
+  Renderer.write(y, 1, "  [a] Add repository")
+  Renderer.write(y + 1, 1, "  [q] Quit")
+end
+
+function Renderer.fileBrowser(state)
+  local w, h = term.getSize()
+  local items = stateGetDirContents(state)
+  state.items = items
+
+  Renderer.clear()
+
+  -- Breadcrumbs
+  local bc = "ghclone > " .. (state.repo or "")
+  if state.path ~= "" then
+    for _, part in ipairs(split(state.path, "/")) do
+      bc = bc .. " > " .. part
+    end
+  end
+  Renderer.write(1, 1, bc:sub(1, w))
+
+  Renderer.separator(2, w)
+
+  local total = #items
+  local pages = math.max(1, math.ceil(total / PER_PAGE))
+  if state.page > pages then state.page = pages end
+  if state.page < 1 then state.page = 1 end
+
+  local start = (state.page - 1) * PER_PAGE + 1
+  local finish = math.min(start + PER_PAGE - 1, total)
+
+  for i = 1, PER_PAGE do
+    local idx = start + i - 1
+    Renderer.write(2 + i, 1, "  ")
+  end
+
+  for i = start, finish do
+    local item = items[i]
+    local y = 2 + (i - start + 1)
+    local cur = (i == state.cursor) and ">" or " "
+    local sel = state.selected[item.path] and "X" or " "
+    local name = item.name
+    if item.isDir then name = name .. "/" end
+    local line = cur .. "[" .. sel .. "] " .. name
+    if #line > w then line = line:sub(1, w) end
+    Renderer.write(y, 1, line)
+  end
+
+  -- Page nav
+  if state.page > 1 then Renderer.write(3, 1, "< Prev") end
+  if state.page < pages then Renderer.write(7, w - 6, "Next >") end
+
+  Renderer.separator(8, w)
+
+  Renderer.write(9, 1, "Page " .. state.page .. "/" .. pages .. "  Sel: " .. stateCountSelected(state))
+  Renderer.write(10, 1, "[SPC] Toggle [a]All [d]Load [q]uit [<][>]")
+end
+
+function Renderer.download(state)
+  local w, h = term.getSize()
+  Renderer.clear()
+  Renderer.write(1, 1, "Downloading...")
+  Renderer.separator(2, w)
+
+  local queue = state.downloadQueue
+  local results = state.downloadResults
+
+  for i, filePath in ipairs(queue) do
+    if i > h then break end
+    local status = results[filePath]
+    if status == true then
+      Renderer.write(2 + i, 1, "[X] " .. filePath)
+    elseif status == false then
+      Renderer.write(2 + i, 1, "[!] " .. filePath .. " FAILED")
+    elseif status then
+      Renderer.write(2 + i, 1, "[ ] " .. filePath .. " (" .. status .. "%)")
+    else
+      Renderer.write(2 + i, 1, "[ ] " .. filePath)
+    end
+  end
+
+  if state.downloadRunning then
+    Renderer.write(h, 1, "Downloading... press q to cancel")
+  else
+    Renderer.write(h, 1, "Done. Press any key to continue")
+  end
+end
+
+function Renderer.draw(state)
+  if state.screen == SCREENS.REPO_SELECT then
+    Renderer.repoSelect(state)
+  elseif state.screen == SCREENS.FILE_BROWSER then
+    Renderer.fileBrowser(state)
+  elseif state.screen == SCREENS.DOWNLOAD then
+    Renderer.download(state)
+  end
+end
+
+-- ========================================
+-- INPUT HANDLER
+-- ========================================
+local Input = {}
+
+local KEY_UP = 200
+local KEY_DOWN = 208
+local KEY_LEFT = 203
+local KEY_RIGHT = 205
+local KEY_ENTER = 28
+local KEY_SPACE = 57
+local KEY_A = 65
+local KEY_D = 68
+local KEY_Q = 81
+local KEY_S = 83
+local KEY_A_low = 97
+local KEY_D_low = 100
+local KEY_Q_low = 113
+local KEY_S_low = 115
+
+function Input.handleRepoSelect(state, event, a1, a2, a3)
+  if event == "key" then
+    local key = a1
+    if key == KEY_DOWN then
+      if state.cursor < #state.repos then state.cursor = state.cursor + 1 else state.cursor = 1 end
+    elseif key == KEY_UP then
+      if state.cursor > 1 then state.cursor = state.cursor - 1 else state.cursor = #state.repos end
+    elseif key == KEY_ENTER or key == KEY_RIGHT then
+      if #state.repos > 0 then
+        state.repo = state.repos[state.cursor]
+        state.screen = SCREENS.FILE_BROWSER
+        state.path = ""
+        state.cursor = 1
+        state.page = 1
+        state.selected = {}
+        local tree, err = GitHub.getTree(state.repo, state.branch, state.token)
+        if tree then
+          state.tree = tree
+        else
+          state.screen = SCREENS.REPO_SELECT
+        end
+      end
+    elseif key == KEY_A or key == KEY_A_low then
+      Input.promptAddRepo(state)
+    elseif key == KEY_Q or key == KEY_Q_low then
+      return false
+    end
+  elseif event == "mouse_click" then
+    local y = a2
+    local idx = y - 2
+    if idx >= 1 and idx <= #state.repos then
+      state.cursor = idx
+      state.repo = state.repos[state.cursor]
+      state.screen = SCREENS.FILE_BROWSER
+      state.path = ""
+      state.cursor = 1
+      state.page = 1
+      state.selected = {}
+      local tree, err = GitHub.getTree(state.repo, state.branch, state.token)
+      if tree then
+        state.tree = tree
+      else
+        state.screen = SCREENS.REPO_SELECT
+      end
+    end
+  end
+  return true
+end
+
+function Input.promptAddRepo(state)
+  Renderer.clear()
+  Renderer.write(1, 1, "Enter repo (user/repo): ")
+  local input = read()
+  if input and input ~= "" then
+    input = trim(input)
+    local repos = loadRepos()
+    local exists = false
+    for _, r in ipairs(repos) do
+      if r == input then exists = true; break end
+    end
+    if not exists then
+      repos[#repos + 1] = input
+      saveRepos(repos)
+      state.repos = repos
+    end
+  end
+  Renderer.draw(state)
+end
+
+function Input.handleFileBrowser(state, event, a1, a2, a3)
+  local items = stateGetDirContents(state)
+  state.items = items
+  local total = #items
+  if total == 0 then total = 1 end
+  local pages = math.max(1, math.ceil(total / PER_PAGE))
+
+  if event == "key" then
+    local key = a1
+    if key == KEY_DOWN then
+      if state.cursor < total then
+        state.cursor = state.cursor + 1
+        if state.cursor > state.page * PER_PAGE then
+          state.page = state.page + 1
+        end
+      end
+    elseif key == KEY_UP then
+      if state.cursor > 1 then
+        state.cursor = state.cursor - 1
+        if state.cursor < (state.page - 1) * PER_PAGE + 1 then
+          state.page = state.page - 1
+        end
+      end
+    elseif key == KEY_LEFT then
+      if state.path == "" then
+        -- Go back to repo select only if at root
+        state.screen = SCREENS.REPO_SELECT
+        state.cursor = 1
+      else
+        -- Go to parent directory
+        local parts = split(state.path, "/")
+        table.remove(parts)
+        state.path = table.concat(parts, "/")
+        state.cursor = 1
+        state.page = 1
+        state.items = stateGetDirContents(state)
+      end
+    elseif key == KEY_RIGHT or key == KEY_ENTER then
+      local item = items[state.cursor]
+      if item and item.isDir then
+        state.path = item.path
+        state.cursor = 1
+        state.page = 1
+        state.items = stateGetDirContents(state)
+      end
+    elseif key == KEY_SPACE or key == KEY_S or key == KEY_S_low then
+      local item = items[state.cursor]
+      if item then stateSelectItem(state, item) end
+    elseif key == KEY_A or key == KEY_A_low then
+      stateSelectAll(state)
+    elseif key == KEY_D or key == KEY_D_low then
+      if stateCountSelected(state) > 0 then
+        state.downloadQueue = {}
+        for p, _ in pairs(state.selected) do
+          state.downloadQueue[#state.downloadQueue + 1] = p
+        end
+        table.sort(state.downloadQueue)
+        state.downloadResults = {}
+        state.downloadRunning = true
+        state.screen = SCREENS.DOWNLOAD
+        Input.runDownload(state)
+      end
+    elseif key == KEY_Q or key == KEY_Q_low then
+      if state.path == "" then
+        state.screen = SCREENS.REPO_SELECT
+        state.cursor = 1
+      else
+        local parts = split(state.path, "/")
+        table.remove(parts)
+        state.path = table.concat(parts, "/")
+        state.cursor = 1
+        state.page = 1
+        state.items = stateGetDirContents(state)
+      end
+    end
+  elseif event == "mouse_click" then
+    local y = a2
+    local idx = y - 2
+    if idx >= 1 and idx <= PER_PAGE then
+      local itemIdx = (state.page - 1) * PER_PAGE + idx
+      if itemIdx >= 1 and itemIdx <= #items then
+        state.cursor = itemIdx
+      end
+    end
+  end
+  return true
+end
+
+-- ========================================
+-- DOWNLOADER
+-- ========================================
+function Input.runDownload(state)
+  local queue = state.downloadQueue
+  local base = shell.dir()
+  if base == "/" then base = "" end
+
+  for i, filePath in ipairs(queue) do
+    if not state.downloadRunning then break end
+
+    local url = "https://raw.githubusercontent.com/" .. state.repo .. "/" .. state.branch .. "/" .. filePath
+    local fp = base .. "/" .. filePath
+    local dir = fs.getDir(fp)
+
+    state.downloadResults[filePath] = 0
+    Renderer.download(state)
+
+    if not fs.exists(dir) then fs.makeDir(dir) end
+
+    local content = GitHub.getFile(url)
+    if content then
+      local f = fs.open(fp, "w")
+      if f then
+        f.write(content)
+        f.close()
+        state.downloadResults[filePath] = true
+      else
+        state.downloadResults[filePath] = false
+      end
+    else
+      state.downloadResults[filePath] = false
+    end
+
+    Renderer.download(state)
+  end
+
+  state.downloadRunning = false
+  Renderer.download(state)
+
+  -- Wait for key press to continue
+  while true do
+    local ev = os.pullEvent()
+    if ev == "key" or ev == "mouse_click" then break end
+  end
+
+  state.screen = SCREENS.FILE_BROWSER
+  Renderer.draw(state)
+end
+
+-- ========================================
+-- MAIN
+-- ========================================
+local function setupState()
+  local state = newState()
+  state.repos = loadRepos()
+  state.token = getToken()
+  if not state.token then
+    Renderer.clear()
+    Renderer.write(1, 1, "ghclone - Setup")
+    Renderer.write(2, 1, "GitHub token (ENTER = public only): ")
+    local input = read()
+    if input and input ~= "" then
+      writeFile(ENV_PATH, input)
+      state.token = input
+    end
+  end
+  Renderer.write(3, 1, "Branch [master]: ")
+  local input = read()
+  if input and input ~= "" then state.branch = input end
+  return state
+end
+
+local function run()
+  local state = setupState()
+
+  Renderer.draw(state)
+
+  while true do
+    local event, a1, a2, a3 = os.pullEvent()
+    local running = true
+
+    if state.screen == SCREENS.REPO_SELECT then
+      running = Input.handleRepoSelect(state, event, a1, a2, a3)
+    elseif state.screen == SCREENS.FILE_BROWSER then
+      running = Input.handleFileBrowser(state, event, a1, a2, a3)
+    elseif state.screen == SCREENS.DOWNLOAD then
+      -- Download runs in its own pullEvent loop
+    end
+
+    if not running then break end
+    Renderer.draw(state)
+  end
+
+  term.clear()
+  term.setCursorPos(1, 1)
+end
+
+local function directClone(repo, subdir, branch, token)
+  local tree, err = GitHub.getTree(repo, branch, token)
+  if not tree then
+    print("Error: " .. err)
+    return
+  end
 
   local prefix = subdir and (subdir .. "/") or ""
   local files = {}
@@ -95,133 +651,40 @@ local function clone(repo, subdir, branch, token)
     if not fs.exists(dir) then fs.makeDir(dir) end
 
     local url = "https://raw.githubusercontent.com/" .. repo .. "/" .. branch .. "/" .. path
-    local resp = http.get(url)
-    if resp then
-      local c = resp.readAll()
-      resp.close()
+    local content = GitHub.getFile(url)
+    if content then
       local f = fs.open(fp, "w")
-      if f then f.write(c) f.close() end
+      if f then f.write(content) f.close() end
       ok = ok + 1
     else
       fail = fail + 1
     end
   end
-
   print("Done: " .. ok .. " files" .. (fail > 0 and (", " .. fail .. " failed") or ""))
-  return fail == 0
-end
 
--- Add repo to /repos
-local function promptRepo()
-  write("Enter repo (user/repo): ")
-  local input = read()
-  if not input or input == "" then return nil end
-  input = input:gsub("^%s*(.-)%s*$", "%1")
-  local repos = loadRepos()
-  for _, r in ipairs(repos) do
-    if r == input then print("Already in list"); return input end
-  end
-  repos[#repos + 1] = input
-  saveRepos(repos)
-  print("Added " .. input)
-  return input
-end
-
--- Interactive mode
-local function interactive()
-  print("== ghclone")
-  local token = getToken()
-  if not token then
-    write("GitHub token (or ENTER for public only): ")
-    token = read()
-    if token and token ~= "" then
-      writeFile("/env", token)
-      print("Token saved to /env")
-    else
-      token = nil
-    end
-  end
-
-  write("Branch [master]: ")
-  local branch = read()
-  if not branch or branch == "" then branch = "master" end
-
-  while true do
-    local repos = loadRepos()
-    if #repos == 0 then
-      print("No repos in list. Add one:")
-      if not promptRepo() then return end
-      repos = loadRepos()
-    end
-
-    print()
-    print("=== ghclone ===")
-    for i, r in ipairs(repos) do
-      print("  [" .. i .. "] " .. r)
-    end
-    print("  [a] Add repo")
-    print("  [q] Quit")
-    write("> ")
-
-    local sel = read()
-    if not sel or sel == "" or sel == "q" then return end
-
-    local repo
-    if sel == "a" then
-      repo = promptRepo()
-      if not repo then return end
-    else
-      local n = tonumber(sel)
-      if n and n >= 1 and n <= #repos then
-        repo = repos[n]
-      else
-        print("Invalid")
-      end
-    end
-
-    if repo then
-      local dirs, err = getDirs(repo, branch, token)
-      if dirs then
-        print()
-        print("=== " .. repo .. " ===")
-        print("  [ENTER] Clone everything")
-        for i, d in ipairs(dirs) do
-          print("  [" .. i .. "] " .. d .. "/")
-        end
-        print("  [b] Back")
-        write("> ")
-
-        local s = read()
-        if s ~= "b" and s ~= nil then
-          local subdir = nil
-          if s ~= "" then
-            local n = tonumber(s)
-            if n and n >= 1 and n <= #dirs then
-              subdir = dirs[n]
-            else
-              print("Invalid")
-            end
-          end
-
-          if subdir or s == "" then
-            local label = subdir and (repo .. "/" .. subdir) or repo
-            local from = subdir or repo:match("/(.+)$")
-            print("Cloning " .. label .. " -> " .. shell.dir() .. "/" .. from)
-            clone(repo, subdir, branch, token)
-          end
-        end
-      else
-        print("Error: " .. err)
-      end
+  -- Self-install
+  if not fs.exists("ghclone") then
+    local content = GitHub.getFile(SELF_URL)
+    if content then
+      local f = fs.open("ghclone", "w")
+      if f then f.write(content) f.close() end
     end
   end
 end
 
--- Main
+-- Entry point
 local args = {...}
 
 if #args == 0 then
-  interactive()
+  -- Self-install if not saved locally
+  if not fs.exists("ghclone") then
+    local content = GitHub.getFile(SELF_URL)
+    if content then
+      local f = fs.open("ghclone", "w")
+      if f then f.write(content) f.close() end
+    end
+  end
+  run()
   return
 end
 
@@ -231,40 +694,34 @@ if args[1] == "--add" then
     repos[#repos + 1] = args[2]
     saveRepos(repos)
     print("Added " .. args[2])
-  else
-    promptRepo()
   end
   return
 end
 
 if args[1] == "--help" or args[1] == "-h" then
-  print("ghclone - clone GitHub repos to CC:T")
+  print("ghclone v3 - GitHub browser for CC:T")
   print()
-  print("  ghclone                        Interactive mode")
-  print("  ghclone <user/repo>[/subdir]   Clone to current dir")
-  print("  ghclone ... <branch> <token>   Specify branch/token")
-  print("  ghclone --add <user/repo>      Add repo to list")
-  print("  ghclone --init <token>         Save token to /env")
+  print("  ghclone                  Interactive file browser")
+  print("  ghclone <user/repo>      Direct clone to current dir")
+  print("  ghclone <user/repo>/sub  Clone subdirectory")
+  print("  ghclone ... <branch>     Specify branch")
+  print("  ghclone --add <user>     Add repo to list")
+  print()
+  print("Browser keys:")
+  print("  [SPC] Toggle selection   [a] Select all")
+  print("  [d] Download selected    [q] Back / Quit")
+  print("  [<][>] Page navigation   Mouse click supported")
   return
 end
 
-if args[1] == "--init" and args[2] then
-  writeFile("/env", args[2])
-  print("Token saved to /env")
-  return
-end
-
--- Direct mode: ghclone user/repo[/subdir] [branch] [token]
+-- Direct mode
 local raw = args[1]
 local branch = args[2] or "master"
-
--- Save token if provided (before getToken, so it persists for next run)
-if args[3] and args[3] ~= "" then
-  writeFile("/env", args[3])
-  print("Token saved to /env")
-end
-
 local token = args[3] or getToken()
+
+if args[3] and args[3] ~= "" then
+  writeFile(ENV_PATH, args[3])
+end
 
 local first = raw:find("/")
 if not first then
@@ -272,7 +729,6 @@ if not first then
   return
 end
 
-local user = raw:sub(1, first - 1)
 local rest = raw:sub(first + 1)
 local second = rest:find("/")
 local repoName, subdir
@@ -286,19 +742,7 @@ else
   subdir = nil
 end
 
-local repo = user .. "/" .. repoName
+local repo = raw:sub(1, first) .. repoName
 local label = subdir and (repo .. "/" .. subdir) or repo
 print("== " .. label .. " (" .. branch .. ")")
-clone(repo, subdir, branch, token)
-
--- Self-install (only if in current dir and ghclone doesn't exist)
-if not fs.exists("ghclone") then
-  local url = "https://raw.githubusercontent.com/Gazdea/ghclone/master/ghclone.lua"
-  local resp = http.get(url)
-  if resp then
-    local c = resp.readAll()
-    resp.close()
-    local f = fs.open("ghclone", "w")
-    if f then f.write(c) f.close() end
-  end
-end
+directClone(repo, subdir, branch, token)
