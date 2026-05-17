@@ -120,7 +120,31 @@ local function newState()
     downloadQueue = {},
     downloadResults = {},
     downloadRunning = false,
+    -- Cache for update status
+    statusCache = {},
   }
+end
+
+local function stateBuildCache(state)
+  state.statusCache = {}
+  local prefix = state.path ~= "" and (state.path .. "/") or ""
+  local base = shell.dir()
+  if base == "/" then base = "" end
+
+  for _, entry in ipairs(state.tree.tree) do
+    if entry.type == "blob" and entry.path:find(prefix, 1, true) == 1 then
+      local rest = entry.path:sub(#prefix + 1)
+      if not rest:find("/") then
+        local localPath = base .. "/" .. entry.path
+        if fs.exists(localPath) then
+          local localSize = fs.getSize(localPath)
+          state.statusCache[entry.path] = (localSize == entry.size) and " " or "U"
+        else
+          state.statusCache[entry.path] = "N"
+        end
+      end
+    end
+  end
 end
 
 function stateGetDirContents(state)
@@ -153,6 +177,14 @@ function stateGetDirContents(state)
   for _, d in ipairs(dirs) do items[#items + 1] = d end
   for _, f in ipairs(files) do items[#items + 1] = f end
   return items
+end
+
+function stateNavigate(state, path)
+  state.path = path or ""
+  state.cursor = 1
+  state.page = 1
+  state.items = stateGetDirContents(state)
+  stateBuildCache(state)
 end
 
 function stateGetFilesInDir(state, dirPath)
@@ -290,12 +322,34 @@ function Renderer.fileBrowser(state)
     local item = items[i]
     local y = 2 + (i - start + 1)
     local cur = (i == state.cursor) and ">" or " "
-    local sel = state.selected[item.path] and "X" or " "
+
+    local sel
+    if state.selected[item.path] then
+      sel = "X"
+      term.setTextColor(colors.white)
+    elseif item.isDir then
+      sel = " "
+      term.setTextColor(colors.white)
+    else
+      local status = state.statusCache[item.path]
+      if status == "N" then
+        sel = "N"
+        term.setTextColor(colors.green)
+      elseif status == "U" then
+        sel = "U"
+        term.setTextColor(colors.yellow)
+      else
+        sel = " "
+        term.setTextColor(colors.white)
+      end
+    end
+
     local name = item.name
     if item.isDir then name = name .. "/" end
     local line = cur .. "[" .. sel .. "] " .. name
     if #line > w then line = line:sub(1, w) end
     Renderer.write(y, 1, line)
+    term.setTextColor(colors.white)
   end
 
   Renderer.separator(8, w)
@@ -354,14 +408,12 @@ local Input = {}
 
 function Input.selectRepo(state, repo)
   state.repo = repo
-  state.screen = SCREENS.FILE_BROWSER
-  state.path = ""
-  state.cursor = 1
-  state.page = 1
   state.selected = {}
   local tree, err = GitHub.getTree(state.repo, state.branch, state.token)
   if tree then
     state.tree = tree
+    state.screen = SCREENS.FILE_BROWSER
+    stateNavigate(state, "")
   else
     state.screen = SCREENS.REPO_SELECT
   end
@@ -453,18 +505,12 @@ function Input.handleFileBrowser(state, event, a1, a2, a3)
       else
         local parts = split(state.path, "/")
         table.remove(parts)
-        state.path = table.concat(parts, "/")
-        state.cursor = 1
-        state.page = 1
-        state.items = stateGetDirContents(state)
+        stateNavigate(state, table.concat(parts, "/"))
       end
     elseif key == keys.right or key == keys.enter or key == keys.kpEnter then
       local item = items[state.cursor]
       if item and item.isDir then
-        state.path = item.path
-        state.cursor = 1
-        state.page = 1
-        state.items = stateGetDirContents(state)
+        stateNavigate(state, item.path)
       end
     elseif key == keys.space or key == keys.s then
       local item = items[state.cursor]
@@ -490,10 +536,7 @@ function Input.handleFileBrowser(state, event, a1, a2, a3)
       else
         local parts = split(state.path, "/")
         table.remove(parts)
-        state.path = table.concat(parts, "/")
-        state.cursor = 1
-        state.page = 1
-        state.items = stateGetDirContents(state)
+        stateNavigate(state, table.concat(parts, "/"))
       end
     end
   elseif event == "mouse_scroll" then
@@ -528,10 +571,7 @@ function Input.handleFileBrowser(state, event, a1, a2, a3)
           local item = items[itemIdx]
           if item then
             if item.isDir then
-              state.path = item.path
-              state.cursor = 1
-              state.page = 1
-              state.items = stateGetDirContents(state)
+              stateNavigate(state, item.path)
             else
               stateSelectItem(state, item)
             end
@@ -590,6 +630,7 @@ function Input.runDownload(state)
   end
 
   state.screen = SCREENS.FILE_BROWSER
+  stateBuildCache(state)
   Renderer.draw(state)
 end
 
