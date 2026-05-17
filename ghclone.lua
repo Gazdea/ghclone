@@ -125,7 +125,26 @@ local function newState()
   }
 end
 
+local function stateDirSelected(state, dirPath)
+  local prefix = dirPath .. "/"
+  if not state.tree or not state.tree.tree then return " " end
+  local total, sel = 0, 0
+  for _, entry in ipairs(state.tree.tree) do
+    if entry.type == "blob" and entry.path:find(prefix, 1, true) == 1 then
+      local rest = entry.path:sub(#prefix + 1)
+      if not rest:find("/") then
+        total = total + 1
+        if state.selected[entry.path] then sel = sel + 1 end
+      end
+    end
+  end
+  if sel == 0 then return " " end
+  if sel == total then return "X" end
+  return "~"
+end
+
 local function stateBuildCache(state)
+  if not state.tree or not state.tree.tree then return end
   state.statusCache = {}
   local prefix = state.path ~= "" and (state.path .. "/") or ""
   local base = shell.dir()
@@ -328,7 +347,7 @@ function Renderer.fileBrowser(state)
       sel = "X"
       term.setTextColor(colors.white)
     elseif item.isDir then
-      sel = " "
+      sel = stateDirSelected(state, item.path)
       term.setTextColor(colors.white)
     else
       local status = state.statusCache[item.path]
