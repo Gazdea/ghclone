@@ -282,6 +282,10 @@ function Renderer.fileBrowser(state)
   local start = (state.page - 1) * PER_PAGE + 1
   local finish = math.min(start + PER_PAGE - 1, total)
 
+  for i = 1, PER_PAGE do
+    Renderer.write(2 + i, 1, string.rep(" ", w))
+  end
+
   for i = start, finish do
     local item = items[i]
     local y = 2 + (i - start + 1)
@@ -348,7 +352,20 @@ end
 -- ========================================
 local Input = {}
 
--- Use CC:T keys API for correct scancodes
+function Input.selectRepo(state, repo)
+  state.repo = repo
+  state.screen = SCREENS.FILE_BROWSER
+  state.path = ""
+  state.cursor = 1
+  state.page = 1
+  state.selected = {}
+  local tree, err = GitHub.getTree(state.repo, state.branch, state.token)
+  if tree then
+    state.tree = tree
+  else
+    state.screen = SCREENS.REPO_SELECT
+  end
+end
 
 function Input.handleRepoSelect(state, event, a1, a2, a3)
   if event == "key" then
@@ -359,19 +376,17 @@ function Input.handleRepoSelect(state, event, a1, a2, a3)
       if state.cursor > 1 then state.cursor = state.cursor - 1 else state.cursor = #state.repos end
     elseif key == keys.enter or key == keys.right or key == keys.kpEnter then
       if #state.repos > 0 then
-        state.repo = state.repos[state.cursor]
-        state.screen = SCREENS.FILE_BROWSER
-        state.path = ""
-        state.cursor = 1
-        state.page = 1
-        state.selected = {}
-        local tree, err = GitHub.getTree(state.repo, state.branch, state.token)
-        if tree then
-          state.tree = tree
-        else
-          state.screen = SCREENS.REPO_SELECT
-        end
+        Input.selectRepo(state, state.repos[state.cursor])
       end
+    elseif key >= keys.one and key <= keys.nine then
+      local idx = key - keys.one + 1
+      if idx <= #state.repos then
+        state.cursor = idx
+        Input.selectRepo(state, state.repos[idx])
+      end
+    elseif key == keys.zero and #state.repos >= 10 then
+      state.cursor = 10
+      Input.selectRepo(state, state.repos[10])
     elseif key == keys.a then
       Input.promptAddRepo(state)
     elseif key == keys.q then
@@ -382,18 +397,7 @@ function Input.handleRepoSelect(state, event, a1, a2, a3)
     local idx = my - 2
     if idx >= 1 and idx <= #state.repos then
       state.cursor = idx
-      state.repo = state.repos[state.cursor]
-      state.screen = SCREENS.FILE_BROWSER
-      state.path = ""
-      state.cursor = 1
-      state.page = 1
-      state.selected = {}
-      local tree, err = GitHub.getTree(state.repo, state.branch, state.token)
-      if tree then
-        state.tree = tree
-      else
-        state.screen = SCREENS.REPO_SELECT
-      end
+      Input.selectRepo(state, state.repos[idx])
     end
   end
   return true
@@ -596,8 +600,8 @@ local function setupState()
   local state = newState()
   state.repos = loadRepos()
   state.token = getToken()
+  Renderer.clear()
   if not state.token then
-    Renderer.clear()
     Renderer.write(1, 1, "ghclone - Setup")
     Renderer.write(2, 1, "GitHub token (ENTER = public only): ")
     local input = read()
@@ -605,8 +609,9 @@ local function setupState()
       writeFile(ENV_PATH, input)
       state.token = input
     end
+    Renderer.clear()
   end
-  Renderer.write(3, 1, "Branch [master]: ")
+  Renderer.write(1, 1, "Branch [" .. (state.branch or "master") .. "]: ")
   local input = read()
   if input and input ~= "" then state.branch = input end
   return state
